@@ -13,14 +13,37 @@ echo "=== lac-SUT (debian): room=$ROOM ingress-port=$PORT ==="
 
 sup() { n="$1"; shift; while :; do echo "[sup] start $n"; "$@"; echo "[sup] $n exit=$?; restart 2s"; sleep 2; done; }
 
+# Age-capped supervisor for the shell-server peer. The relay can EVICT the peer on a keepalive
+# (FRAME_PONG) timeout, after which it sits ALIVE-BUT-DROPPED (studio-log 2026-07-31: repeated
+# "control request timeout" heartbeats → "no FRAME_PONG in 355s, closing tunnel" → slots=0, and it does
+# NOT self-reconnect until a client pokes it). The plain exit-based `sup` never catches that (the process
+# never exits). Fix: cap the peer's age WELL UNDER the eviction window so a fresh, re-registered peer is
+# always in the room — mechanism-independent (it doesn't matter WHY it dropped). --stable-peer-id makes
+# each refresh reclaim its own slot; detached punch jobs (setsid) + short fleetctl commands survive the
+# ~2 s re-register gap. Tune via PEER_MAX_AGE (default 180 s, safely under the ~355 s eviction seen live).
+peer_sup() {
+  while :; do
+    echo "[sup] start peer (age-cap ${PEER_MAX_AGE:-180}s)"
+    lac tunnel "$ROOM" --relay ws://127.0.0.1:"$PORT"/ws --shell-server --stable-peer-id &
+    pid=$!
+    ( sleep "${PEER_MAX_AGE:-180}"; kill "$pid" 2>/dev/null ) &
+    ager=$!
+    wait "$pid" 2>/dev/null
+    kill "$ager" 2>/dev/null
+    echo "[sup] peer refresh (age-cap or exit); restart 2s"
+    sleep 2
+  done
+}
+
 # 1. health backend so the PaaS/EAS edge probe on / and /health stays HTTP 200.
 sup health python3 -m http.server 7861 --bind 127.0.0.1 --directory /app/www &
 sleep 1
 # 2. relay/gateway on the ingress: /ws -> internal tunnel; everything else -> health backend.
 sup relay lac relay --listen 0.0.0.0:"$PORT" --fallback 127.0.0.1:7861 --tunnel-path /ws &
 sleep 3
-# 3. in-container peer: PTY shell-server + FileShare(cp) + Socks5 + -L/-R exit into this box.
-sup peer lac tunnel "$ROOM" --relay ws://127.0.0.1:"$PORT"/ws --shell-server --stable-peer-id &
+# 3. in-container peer (PTY shell-server + FileShare(cp) + Socks5 + -L/-R): age-capped watchdog
+#    (see peer_sup) so a relay keepalive-eviction can't leave it alive-but-dropped.
+peer_sup &
 # 4. optional sshd for ssh-over-punch tests (enable with SSHD=1; inject SSH_PUBKEY).
 if [ -n "${SSHD:-}" ]; then
   if [ -n "${SSH_PUBKEY:-}" ]; then
