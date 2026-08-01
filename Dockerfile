@@ -22,7 +22,7 @@ RUN set -eux; \
     apt-get update && apt-get install -y --no-install-recommends \
       openssh-server openssh-client ca-certificates curl python3 \
       iproute2 iputils-ping dnsutils tcpdump netcat-openbsd socat traceroute \
-      procps net-tools iperf3 conntrack; \
+      procps net-tools iperf3 conntrack gzip; \
     rm -rf /var/lib/apt/lists/*; \
     mkdir -p /run/sshd /app/www; printf ok > /app/www/health; printf ok > /app/www/index.html; \
     ssh-keygen -A; \
@@ -30,6 +30,12 @@ RUN set -eux; \
 COPY lac /usr/local/bin/lac
 COPY lac-entry.sh /entrypoint.sh
 RUN chmod 0755 /usr/local/bin/lac /entrypoint.sh && /usr/local/bin/lac --version
+# Bake the glibc `nt-punch` hole-punch binary so it survives Render's idle-spindown cold-starts
+# (runtime `lac cp` pushes are wiped on restart and truncated by the edge). Shipped gzipped to keep
+# the build context lean, decompressed here. Dynamically linked against a glibc 2.17 floor — the
+# debian:stable-slim glibc satisfies it; `gzip` is installed above so `gunzip` is present.
+COPY nt-punch.gz /tmp/nt-punch.gz
+RUN gunzip -c /tmp/nt-punch.gz > /usr/local/bin/nt-punch && chmod 0755 /usr/local/bin/nt-punch && rm /tmp/nt-punch.gz
 WORKDIR /app
 EXPOSE 7860
 CMD ["/entrypoint.sh"]
